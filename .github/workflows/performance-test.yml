@@ -348,21 +348,21 @@ jobs:
       if: ${{ matrix.perf-test == 'kubelet-density-cni' || matrix.perf-test == 'udn-density-l2-noPods' || matrix.perf-test == 'cudn-density-l2-noPods' }}
       uses: actions/upload-artifact@v4
       with:
-        name: performance-report-${{ github.run_id }}
+        name: ${{ matrix.perf-test }}-performance-report-${{ github.run_id }}
         path: /tmp/${{ matrix.perf-test }}/performance_report.md
 
     - name: Upload pprof data
       if: ${{ matrix.perf-test == 'kubelet-density-cni' || matrix.perf-test == 'udn-density-l2-noPods' || matrix.perf-test == 'cudn-density-l2-noPods' }}
       uses: actions/upload-artifact@v4
       with:
-        name: pprof-${{ github.run_id }}
+        name: ${{ matrix.perf-test }}-pprof-${{ github.run_id }}
         path: /tmp/${{ matrix.perf-test }}/pprof-data
 
     - name: Upload performance test data
       if: ${{ matrix.perf-test == 'kubelet-density-cni' || matrix.perf-test == 'udn-density-l2-noPods' || matrix.perf-test == 'cudn-density-l2-noPods' }}
       uses: actions/upload-artifact@v4
       with:
-        name: performance-test-data-${{ github.run_id }}
+        name: ${{ matrix.perf-test }}-performance-test-data-${{ github.run_id }}
         path: /tmp/${{ matrix.perf-test }} 
 
     - name: Export kind logs
@@ -375,7 +375,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: kind-logs-${{ matrix.perf-test }}-${{ github.run_id }}
+        name: ${{ matrix.perf-test }}-kind-logs-${{ github.run_id }}
         path: /tmp/${{ matrix.perf-test }}/logs
 
   build-pr:

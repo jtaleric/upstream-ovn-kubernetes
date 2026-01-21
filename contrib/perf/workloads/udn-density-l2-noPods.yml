@@ -23,12 +23,12 @@ global:
         labelSelector: {name: ovnkube-control-plane}
         url: http://localhost:9411/debug/pprof/heap?seconds=30
 jobs:
-  - name: udn-density-l2-noPods
-    jobIterations: 300
+  - name: udn-density-l2-nopods
+    jobIterations: 800
     qps: 10
     burst: 10
     namespacedIterations: true 
-    namespace: udn-density-l2-noPods
+    namespace: udn-density-l2-nopods
     waitWhenFinished: true
     podWait: false 
     preLoadImages: false 
