@@ -3,7 +3,7 @@ global:
   measurements:
     - name: podLatency
     - name: pprof
-      pprofInterval: 1m
+      pprofInterval: 0s
       pprofDirectory: pprof-data
       pprofTargets:
       - name: ovnkube-controller
@@ -17,11 +17,11 @@ global:
       - name: ovnkube-controller-heap
         namespace: "ovn-kubernetes"
         labelSelector: {app: ovnkube-node}
-        url: http://localhost:9410/debug/pprof/heap?seconds=30
+        url: http://localhost:9410/debug/pprof/heap
       - name: ovnkube-control-plane-heap
         namespace: "ovn-kubernetes"
         labelSelector: {name: ovnkube-control-plane}
-        url: http://localhost:9411/debug/pprof/heap?seconds=30
+        url: http://localhost:9411/debug/pprof/heap
 jobs:
   - name: udn-density-l2-pods-netpol
     jobIterations: 100
@@ -31,7 +31,7 @@ jobs:
     namespace: udn-density-l2-pods-netpol
     waitWhenFinished: true
     podWait: false 
-    preLoadImages: false 
+    preLoadImages: true 
     preLoadPeriod: 2m
     churnConfig:
       percent: 10
