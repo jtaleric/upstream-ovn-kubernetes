@@ -1,0 +1,610 @@
+name: performance-report
+
+on:
+  workflow_run:
+    workflows: ["performance-test"]
+    types: 
+      - completed
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  process-performance-results:
+    name: Process Performance Results
+    runs-on: ubuntu-24.04
+    if: github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests PyYAML
+
+    - name: Download kube-burner artifacts
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: ${{ github.event.workflow_run.id }}
+          });
+          
+          console.log('Available artifacts:', artifacts.data.artifacts.map(a => a.name));
+          
+          // Download ALL performance test data artifacts (supports matrix builds)
+          const perfTestArtifacts = artifacts.data.artifacts.filter(
+            artifact => artifact.name.includes('performance-test-data')
+          );
+          
+          console.log(`Found ${perfTestArtifacts.length} performance-test-data artifacts`);
+          for (const artifact of perfTestArtifacts) {
+            console.log('Downloading performance test artifact:', artifact.name);
+            try {
+              const download = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+                archive_format: 'zip'
+              });
+              fs.writeFileSync(`${artifact.name}.zip`, Buffer.from(download.data));
+            } catch (error) {
+              console.error(`Failed to download ${artifact.name}:`, error.message);
+              // Continue with other artifacts
+            }
+          }
+          
+          // Download ALL performance report artifacts
+          const reportArtifacts = artifacts.data.artifacts.filter(
+            artifact => artifact.name.includes('performance-report')
+          );
+          
+          console.log(`Found ${reportArtifacts.length} performance-report artifacts`);
+          for (const artifact of reportArtifacts) {
+            console.log('Downloading performance report artifact:', artifact.name);
+            try {
+              const download = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+                archive_format: 'zip'
+              });
+              fs.writeFileSync(`${artifact.name}.zip`, Buffer.from(download.data));
+            } catch (error) {
+              console.error(`Failed to download ${artifact.name}:`, error.message);
+              // Continue with other artifacts
+            }
+          }
+          
+          
+          // Store artifact counts for later steps
+          core.setOutput('perf_test_count', perfTestArtifacts.length);
+          core.setOutput('report_count', reportArtifacts.length);
+
+    - name: Extract artifacts
+      run: |
+        # Extract all performance test data artifacts
+        for zip in *performance-test-data*.zip; do
+          if [ -f "$zip" ]; then
+            # Extract workload name from artifact name (e.g., kubelet-density-cni-performance-test-data-12345)
+            workload=$(echo "$zip" | sed 's/-performance-test-data-.*//')
+            mkdir -p "perf-data/${workload}"
+            unzip -q "$zip" -d "perf-data/${workload}/"
+            echo "Extracted $zip to perf-data/${workload}/"
+          fi
+        done
+        
+        # Extract all performance report artifacts
+        for zip in *performance-report*.zip; do
+          if [ -f "$zip" ]; then
+            workload=$(echo "$zip" | sed 's/-performance-report-.*//')
+            mkdir -p "reports/${workload}"
+            unzip -q "$zip" -d "reports/${workload}/"
+            echo "Extracted $zip to reports/${workload}/"
+          fi
+        done
+        
+        echo "=== Extracted artifacts structure ==="
+        find perf-data reports -type d 2>/dev/null || true
+
+    - name: Setup kube-burner for indexing
+      run: |
+        # Download kube-burner binary
+        curl -L https://github.com/kube-burner/kube-burner/releases/download/v2.5.0/kube-burner-V2.5.0-linux-x86_64.tar.gz | tar xz
+        chmod +x kube-burner
+        sudo mv kube-burner /usr/local/bin/
+
+    - name: Index results to Elasticsearch
+      env:
+        ES_SERVER: ${{ secrets.PERF_DATASTORE }}
+      run: |
+        if [ -z "$ES_SERVER" ]; then
+          echo "No Elasticsearch server configured, skipping indexing"
+          exit 0
+        fi
+        
+        # Find all metrics directories from extracted performance test data
+        METRICS_DIRS=$(find perf-data -name "metrics" -type d 2>/dev/null || true)
+        
+        if [ -z "$METRICS_DIRS" ]; then
+          echo "::warning::No metrics directories found in artifacts, skipping indexing"
+          exit 0
+        fi
+        
+        echo "Found metrics directories:"
+        echo "$METRICS_DIRS"
+        
+        # Index each metrics directory
+        for METRICS_DIR in $METRICS_DIRS; do
+          # Extract workload name from path (e.g., perf-data/kubelet-density-cni/...)
+          WORKLOAD=$(echo "$METRICS_DIR" | cut -d'/' -f2)
+          echo ""
+          echo "=== Indexing metrics for workload: $WORKLOAD ==="
+          echo "Metrics directory: $METRICS_DIR"
+          
+          # Create indexing configuration for this workload
+          cat > "index-config-${WORKLOAD}.yml" << EOF
+global:
+  writeToFile: false
+  metricsDirectory: $METRICS_DIR
+  indexerConfig:
+    enabled: true
+    esServers: ["$ES_SERVER"]
+    insecureSkipVerify: true
+    defaultIndex: upstream-ovnk-kube-burner
+    type: elastic
+EOF
+          
+          # Index the metrics
+          echo "Indexing performance metrics to Elasticsearch..."
+          kube-burner index --config "index-config-${WORKLOAD}.yml" || echo "Warning: Failed to index $WORKLOAD metrics"
+        done
+        
+        echo ""
+        echo "Successfully indexed all performance data to Elasticsearch"
+
+    - name: Get associated PRs
+      id: get_prs
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Get the commit SHA from the workflow run
+          const workflowRun = await github.rest.actions.getWorkflowRun({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: ${{ github.event.workflow_run.id }}
+          });
+          
+          const headSha = workflowRun.data.head_sha;
+          console.log('Workflow run SHA:', headSha);
+          
+          // Find PRs associated with this commit
+          const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: headSha
+          });
+          
+          console.log('Found PRs:', prs.data.map(pr => pr.number));
+          
+          // Store PR numbers for later use
+          const prNumbers = prs.data.map(pr => pr.number);
+          core.setOutput('pr_numbers', JSON.stringify(prNumbers));
+          
+          return prNumbers;
+
+    - name: Fetch baseline run
+      id: get_baseline
+      if: steps.get_prs.outputs.pr_numbers != '[]'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Find the latest successful scheduled performance test run for baseline
+          console.log('Searching for baseline run (latest successful scheduled run)...');
+
+          const runs = await github.rest.actions.listWorkflowRuns({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'performance-test.yml',
+            event: 'schedule',
+            status: 'success',
+            per_page: 10
+          });
+
+          if (runs.data.workflow_runs.length === 0) {
+            console.log('No baseline run found');
+            core.setOutput('baseline_run_id', '');
+            core.setOutput('baseline_run_url', '');
+            return null;
+          }
+
+          const baselineRun = runs.data.workflow_runs[0];
+          console.log(`Found baseline run: #${baselineRun.id} from ${baselineRun.created_at}`);
+          console.log(`Baseline URL: ${baselineRun.html_url}`);
+
+          core.setOutput('baseline_run_id', baselineRun.id.toString());
+          core.setOutput('baseline_run_url', baselineRun.html_url);
+
+          return baselineRun.id;
+
+    - name: Download baseline artifacts
+      if: steps.get_baseline.outputs.baseline_run_id != ''
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const baselineRunId = '${{ steps.get_baseline.outputs.baseline_run_id }}';
+
+          console.log(`Downloading baseline artifacts from run ${baselineRunId}...`);
+
+          const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: baselineRunId
+          });
+
+          console.log('Available baseline artifacts:', artifacts.data.artifacts.map(a => a.name));
+
+          // Download baseline performance report artifacts
+          const baselineReports = artifacts.data.artifacts.filter(
+            artifact => artifact.name.includes('performance-report')
+          );
+
+          console.log(`Found ${baselineReports.length} baseline report artifacts`);
+          for (const artifact of baselineReports) {
+            console.log('Downloading baseline artifact:', artifact.name);
+            try {
+              const download = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+                archive_format: 'zip'
+              });
+              fs.writeFileSync(`baseline-${artifact.name}.zip`, Buffer.from(download.data));
+            } catch (error) {
+              console.error(`Failed to download baseline ${artifact.name}:`, error.message);
+            }
+          }
+
+    - name: Extract baseline artifacts
+      if: steps.get_baseline.outputs.baseline_run_id != ''
+      run: |
+        # Extract all baseline performance report artifacts
+        for zip in baseline-*performance-report*.zip; do
+          if [ -f "$zip" ]; then
+            # Extract workload name
+            workload=$(echo "$zip" | sed 's/baseline-//' | sed 's/-performance-report-.*//')
+            mkdir -p "baseline-reports/${workload}"
+            unzip -q "$zip" -d "baseline-reports/${workload}/"
+            echo "Extracted baseline: $zip to baseline-reports/${workload}/"
+          fi
+        done
+
+        echo "=== Baseline reports structure ==="
+        find baseline-reports -type d 2>/dev/null || echo "No baseline reports found"
+
+    - name: Post performance report to PRs
+      if: steps.get_prs.outputs.pr_numbers != '[]'
+      uses: actions/github-script@v7
+      env:
+        WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+        WORKFLOW_URL: ${{ github.event.workflow_run.html_url }}
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          const prNumbers = JSON.parse('${{ steps.get_prs.outputs.pr_numbers }}');
+          const conclusion = process.env.WORKFLOW_CONCLUSION;
+          const runId = process.env.WORKFLOW_RUN_ID;
+          const workflowUrl = process.env.WORKFLOW_URL;
+          const baselineRunId = '${{ steps.get_baseline.outputs.baseline_run_id }}';
+          const baselineRunUrl = '${{ steps.get_baseline.outputs.baseline_run_url }}';
+
+          // Helper function to find report files
+          const findReport = (dir) => {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+              const fullPath = path.join(dir, file);
+              if (file === 'performance_report.md') {
+                return fullPath;
+              }
+              if (fs.statSync(fullPath).isDirectory()) {
+                const found = findReport(fullPath);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+
+          // Collect all performance reports from the reports directory
+          let reports = [];
+          const reportsDir = 'reports';
+
+          if (fs.existsSync(reportsDir)) {
+            const workloads = fs.readdirSync(reportsDir);
+            for (const workload of workloads) {
+              const workloadDir = path.join(reportsDir, workload);
+              if (fs.statSync(workloadDir).isDirectory()) {
+                const reportPath = findReport(workloadDir);
+                if (reportPath) {
+                  const content = fs.readFileSync(reportPath, 'utf8');
+                  reports.push({ workload, content });
+                  console.log(`Found report for workload: ${workload}`);
+                }
+              }
+            }
+          }
+
+          // Collect baseline reports
+          let baselineReports = {};
+          const baselineReportsDir = 'baseline-reports';
+
+          if (baselineRunId && fs.existsSync(baselineReportsDir)) {
+            const workloads = fs.readdirSync(baselineReportsDir);
+            for (const workload of workloads) {
+              const workloadDir = path.join(baselineReportsDir, workload);
+              if (fs.statSync(workloadDir).isDirectory()) {
+                const reportPath = findReport(workloadDir);
+                if (reportPath) {
+                  const content = fs.readFileSync(reportPath, 'utf8');
+                  baselineReports[workload] = content;
+                  console.log(`Found baseline report for workload: ${workload}`);
+                }
+              }
+            }
+          }
+
+          // Function to add baseline comparison to report
+          const addBaselineComparison = (currentContent, baselineContent, workload) => {
+            if (!baselineContent) {
+              return currentContent + `\n\n> ℹ️ **No baseline data available for comparison**\n`;
+            }
+
+            // Add baseline info at the top of the report
+            let enhanced = currentContent.replace(
+              /## 🎯 Pod Ready Latency \(Main KPI\)/,
+              `> 📊 **Baseline:** Daily run from ${baselineRunUrl ? `[workflow](${baselineRunUrl})` : 'N/A'}\n\n## 🎯 Pod Ready Latency (Main KPI)`
+            );
+
+            // Parse and compare Pod Latency metrics
+            const parseLatencyTable = (content) => {
+              const avgMatch = content.match(/\| Average Latency \| \*\*([0-9.]+) ms\*\*/);
+              const maxMatch = content.match(/\| Max Latency \| \*\*([0-9.]+) ms\*\*/);
+              const minMatch = content.match(/\| Min Latency \| \*\*([0-9.]+) ms\*\*/);
+              const totalMatch = content.match(/\| Total Pods \| \*\*([0-9]+)\*\*/);
+
+              return {
+                avg: avgMatch ? parseFloat(avgMatch[1]) : null,
+                max: maxMatch ? parseFloat(maxMatch[1]) : null,
+                min: minMatch ? parseFloat(minMatch[1]) : null,
+                total: totalMatch ? parseInt(totalMatch[1]) : null
+              };
+            };
+
+            const current = parseLatencyTable(currentContent);
+            const baseline = parseLatencyTable(baselineContent);
+
+            if (current.avg !== null && baseline.avg !== null) {
+              // Calculate deltas
+              const avgDelta = current.avg - baseline.avg;
+              const avgPercent = baseline.avg ? ((avgDelta / baseline.avg) * 100).toFixed(1) : 0;
+              const maxDelta = current.max - baseline.max;
+              const maxPercent = current.max && baseline.max ? ((maxDelta / baseline.max) * 100).toFixed(1) : 0;
+              const minDelta = current.min - baseline.min;
+              const minPercent = current.min && baseline.min ? ((minDelta / baseline.min) * 100).toFixed(1) : 0;
+
+              // Replace latency table with comparison table
+              const latencyTableRegex = /(\| Metric \| Value \|\n\|--------|-------\|)([\s\S]*?)(\n\n)/;
+              let comparisonTable = `| Metric | Current | Baseline | Change |
+|--------|---------|----------|--------|
+| Average Latency | **${current.avg.toFixed(1)} ms** | ${baseline.avg.toFixed(1)} ms | ${avgDelta > 0 ? '+' : ''}${avgDelta.toFixed(1)} ms (${avgPercent > 0 ? '+' : ''}${avgPercent}%) |
+| Max Latency | **${current.max.toFixed(0)} ms** | ${baseline.max.toFixed(0)} ms | ${maxDelta > 0 ? '+' : ''}${maxDelta.toFixed(0)} ms (${maxPercent > 0 ? '+' : ''}${maxPercent}%) |
+| Min Latency | **${current.min.toFixed(0)} ms** | ${baseline.min.toFixed(0)} ms | ${minDelta > 0 ? '+' : ''}${minDelta.toFixed(0)} ms (${minPercent > 0 ? '+' : ''}${minPercent}%) |`;
+
+              // Add Total Pods if available
+              if (current.total !== null && baseline.total !== null) {
+                const totalDelta = current.total - baseline.total;
+                comparisonTable += `\n| Total Pods | **${current.total}** | ${baseline.total} | ${totalDelta > 0 ? '+' : ''}${totalDelta} |`;
+              } else if (current.total !== null) {
+                comparisonTable += `\n| Total Pods | **${current.total}** | - | - |`;
+              }
+
+              comparisonTable += '\n\n';
+
+              enhanced = enhanced.replace(latencyTableRegex, comparisonTable);
+            }
+
+            return enhanced;
+          };
+
+          // Enhance reports with baseline comparison
+          reports = reports.map(report => ({
+            ...report,
+            content: addBaselineComparison(report.content, baselineReports[report.workload], report.workload)
+          }));
+          
+          // Build header for all comments
+          const buildHeader = (partNum = null, totalParts = null) => {
+            let header = `## 🚀 Performance Test Results`;
+            if (partNum !== null && totalParts !== null) {
+              header += ` (Part ${partNum}/${totalParts})`;
+            }
+            header += `\n\n`;
+            header += `**Status:** ${conclusion === 'success' ? '✅ Completed' : '❌ Failed'}\n`;
+            header += `**Workflow Run:** [#${runId}](${workflowUrl})\n`;
+            if (baselineRunId && baselineRunUrl) {
+              header += `**Baseline:** [Daily run #${baselineRunId}](${baselineRunUrl})\n`;
+            }
+            header += `\n`;
+            if (partNum === null) {
+              header += `**Workloads Tested:** ${reports.length}\n\n`;
+            }
+            header += `---\n\n`;
+            return header;
+          };
+
+          const footer = `\n---\n🤖 Generated by performance-report workflow`;
+          const MAX_COMMENT_SIZE = 60000; // GitHub limit is 65536, use 60k for safety
+
+          // Function to chunk reports if needed
+          const createCommentChunks = () => {
+            if (reports.length === 0) {
+              // Generate a basic report if no detailed reports exist
+              let basicReport = buildHeader();
+
+              if (conclusion === 'success') {
+                basicReport += `### Results Summary\n`;
+                basicReport += `Performance test completed successfully. \n\n`;
+                basicReport += `**Artifacts Available:**\n`;
+                basicReport += `- Performance metrics data\n`;
+                basicReport += `- Cluster logs\n`;
+              } else {
+                basicReport += `### ⚠️ Test Failed\n`;
+                basicReport += `The performance test failed to complete. Please check the [workflow logs](${workflowUrl}) for details.\n`;
+              }
+
+              basicReport += footer;
+              return [basicReport];
+            }
+
+            // Build individual workload sections
+            const workloadSections = reports.map(report => {
+              return `<details>\n<summary><strong>${report.workload}</strong></summary>\n\n${report.content}\n</details>\n\n`;
+            });
+
+            // Try to fit all in one comment first
+            const singleComment = buildHeader() + `**Workloads Tested:** ${reports.length}\n\n---\n\n` + workloadSections.join('') + footer;
+
+            if (singleComment.length <= MAX_COMMENT_SIZE) {
+              return [singleComment];
+            }
+
+            // Need to chunk - split workloads across multiple comments
+            console.log(`Comment too large (${singleComment.length} chars), chunking...`);
+            const chunks = [];
+            let currentChunk = '';
+            let currentWorkloads = [];
+
+            for (let i = 0; i < workloadSections.length; i++) {
+              const section = workloadSections[i];
+              const testChunk = currentChunk + section;
+
+              // Estimate with header and footer (conservative)
+              const estimatedSize = testChunk.length + 500;
+
+              if (estimatedSize > MAX_COMMENT_SIZE && currentChunk.length > 0) {
+                // Current chunk is full, save it and start new one
+                chunks.push({
+                  content: currentChunk,
+                  workloads: [...currentWorkloads]
+                });
+                currentChunk = section;
+                currentWorkloads = [reports[i].workload];
+              } else {
+                currentChunk = testChunk;
+                currentWorkloads.push(reports[i].workload);
+              }
+            }
+
+            // Add the last chunk
+            if (currentChunk.length > 0) {
+              chunks.push({
+                content: currentChunk,
+                workloads: currentWorkloads
+              });
+            }
+
+            // Build final comments with part numbers
+            const totalParts = chunks.length;
+            return chunks.map((chunk, idx) => {
+              const partNum = idx + 1;
+              let comment = buildHeader(partNum, totalParts);
+              comment += `**Workloads in this part:** ${chunk.workloads.join(', ')}\n\n`;
+              comment += `---\n\n`;
+              comment += chunk.content;
+              comment += footer;
+              return comment;
+            });
+          };
+
+          const commentChunks = createCommentChunks();
+          console.log(`Generated ${commentChunks.length} comment chunk(s)`);
+
+          // Post all chunks to each associated PR
+          for (const prNumber of prNumbers) {
+            for (let i = 0; i < commentChunks.length; i++) {
+              try {
+                await github.rest.issues.createComment({
+                  issue_number: prNumber,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: commentChunks[i]
+                });
+                console.log(`Posted performance report part ${i + 1}/${commentChunks.length} to PR #${prNumber}`);
+              } catch (error) {
+                console.error(`Failed to post part ${i + 1} to PR #${prNumber}:`, error.message);
+              }
+            }
+          }
+
+    - name: Upload processed artifacts
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: processed-performance-data-${{ github.event.workflow_run.id }}
+        path: |
+          *.zip
+          perf-data/
+          reports/
+          *.md
+        retention-days: 30
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Performance Report Processing Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Workflow Run ID:** ${{ github.event.workflow_run.id }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Conclusion:** ${{ github.event.workflow_run.conclusion }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Associated PRs:** ${{ steps.get_prs.outputs.pr_numbers }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -n "${{ secrets.PERF_DATASTORE }}" ]; then
+          echo "- **Elasticsearch Indexing:** ✅ Configured" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Elasticsearch Indexing:** ❌ Not configured" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Artifacts Processed" >> $GITHUB_STEP_SUMMARY
+        
+        # Count performance test data artifacts
+        PERF_TEST_COUNT=$(ls -1 *performance-test-data*.zip 2>/dev/null | wc -l)
+        if [ "$PERF_TEST_COUNT" -gt 0 ]; then
+          echo "- ✅ Performance test data: **${PERF_TEST_COUNT}** workload(s)" >> $GITHUB_STEP_SUMMARY
+          for zip in *performance-test-data*.zip; do
+            workload=$(echo "$zip" | sed 's/-performance-test-data-.*//')
+            echo "  - ${workload}" >> $GITHUB_STEP_SUMMARY
+          done
+        else
+          echo "- ❌ Performance test data: none found" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        # Count performance report artifacts
+        REPORT_COUNT=$(ls -1 *performance-report*.zip 2>/dev/null | wc -l)
+        if [ "$REPORT_COUNT" -gt 0 ]; then
+          echo "- ✅ Performance reports: **${REPORT_COUNT}** workload(s)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- ❌ Performance reports: none found" >> $GITHUB_STEP_SUMMARY
+        fi
